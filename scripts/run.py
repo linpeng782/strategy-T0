@@ -44,9 +44,9 @@ EXIT_TIME = "14:50"  # 出场时间点
 # 组合因子权重
 X2_WEIGHT = 2.0  # Z = X1 + X2_WEIGHT * X2
 
-# 共振信号阈值
-X1_THRESHOLD = -0.01  # X1 < -1% 视为超跌
-X2_THRESHOLD = -0.005  # X2 < -0.5% 视为低位换手
+# Z-Score 参数
+ZSCORE_WINDOW = 20  # Z-Score 滚动窗口（天数）
+Z_THRESHOLD = -2.0  # Z-Score 阈值（标准差倍数）
 Y_PROFIT_THRESHOLD = 0.003  # Y > 0.3% 视为盈利
 
 # 输出目录
@@ -59,6 +59,7 @@ def run_single_stock_analysis(
     observe_time: str = OBSERVE_TIME,
     exit_time: str = EXIT_TIME,
     x2_weight: float = X2_WEIGHT,
+    zscore_window: int = ZSCORE_WINDOW,
     verbose: bool = True,
 ) -> dict:
     """
@@ -70,6 +71,7 @@ def run_single_stock_analysis(
         observe_time: 观察时间点
         exit_time: 出场时间点
         x2_weight: X2权重
+        zscore_window: Z-Score 滚动窗口
         verbose: 是否打印详细报告
 
     Returns:
@@ -78,28 +80,30 @@ def run_single_stock_analysis(
     # 1. 加载数据
     df = load_minute_data(stock_code, year=year)
 
-    # 2. 计算特征
+    # 2. 计算特征（含 Z-Score 标准化）
     feature_df = calculate_intraday_features(
         df,
         observe_time=observe_time,
         exit_time=exit_time,
         x2_weight=x2_weight,
+        zscore_window=zscore_window,
     )
 
     # 3. 相关性分析
     stats = calculate_correlation(feature_df)
 
-    # 4. 共振信号分析
+    # 4. 共振信号分析（使用 Z-Score 阈值）
     resonance_stats = calculate_resonance_signals(
         feature_df,
-        x1_threshold=X1_THRESHOLD,
-        x2_threshold=X2_THRESHOLD,
+        z_threshold=Z_THRESHOLD,
         y_profit_threshold=Y_PROFIT_THRESHOLD,
+        use_zscore=True,
     )
 
-    # 5. 分位数分析（使用组合因子Z）
+    # 5. 分位数分析（使用标准化组合因子 Z_final）
+    valid_df = feature_df[feature_df["Z_final"].notna()]
     quantile_df = calculate_quantile_analysis(
-        feature_df, feature_col="Z", n_quantiles=5
+        valid_df, feature_col="Z_final", n_quantiles=5
     )
 
     # 6. 打印报告
@@ -121,6 +125,7 @@ def run_batch_analysis(
     observe_time: str = OBSERVE_TIME,
     exit_time: str = EXIT_TIME,
     x2_weight: float = X2_WEIGHT,
+    zscore_window: int = ZSCORE_WINDOW,
 ) -> pd.DataFrame:
     """
     批量分析多只股票
@@ -131,6 +136,7 @@ def run_batch_analysis(
         observe_time: 观察时间点
         exit_time: 出场时间点
         x2_weight: X2权重
+        zscore_window: Z-Score 滚动窗口
 
     Returns:
         DataFrame: 汇总结果
@@ -140,40 +146,49 @@ def run_batch_analysis(
     # 1. 一次性加载所有股票数据
     df = load_minute_data(stock_codes, year=year)
 
-    # 2. 计算特征
+    # 2. 计算特征（含 Z-Score 标准化）
     feature_df = calculate_intraday_features(
         df,
         observe_time=observe_time,
         exit_time=exit_time,
         x2_weight=x2_weight,
+        zscore_window=zscore_window,
     )
 
-    # 3. 按股票分组分析
-    stock_results = analyze_by_stock(feature_df)
+    # 3. 按股票分组分析（使用 Z-Score 特征）
+    stock_results = analyze_by_stock(feature_df, use_zscore=True)
 
-    # 4. 整体共振信号分析
+    # 4. 整体共振信号分析（使用 Z-Score 阈值）
     resonance_stats = calculate_resonance_signals(
         feature_df,
-        x1_threshold=X1_THRESHOLD,
-        x2_threshold=X2_THRESHOLD,
+        z_threshold=Z_THRESHOLD,
         y_profit_threshold=Y_PROFIT_THRESHOLD,
+        use_zscore=True,
     )
 
     # 5. 打印汇总
-    print_batch_summary(stock_results)
+    print_batch_summary(stock_results, use_zscore=True)
 
-    # 6. 打印整体共振信号
+    # 6. 打印整体共振信号（Z-Score 模式）
     print("\n" + "-" * 70)
-    print("📊 整体共振信号分析")
+    print("📊 整体共振信号分析（Z-Score 模式）")
     print("-" * 70)
-    print(f"总样本数: {resonance_stats['total_samples']}")
-    print(f"超跌共振 (X1<-1% 且 X2<-0.5%):")
+    print(f"有效样本数: {resonance_stats['total_samples']}")
+    print(f"Z-Score 阈值: {resonance_stats['z_threshold']} 个标准差")
+    print(f"超跌共振 (Z_X1 < {Z_THRESHOLD} 且 Z_X2 < {Z_THRESHOLD}):")
     print(
         f"  触发次数: {resonance_stats['resonance_count']} ({resonance_stats['resonance_ratio']*100:.1f}%)"
     )
     print(f"  胜率(Y>0.3%): {resonance_stats['resonance_win_rate']*100:.1f}%")
     print(f"  平均收益: {resonance_stats['resonance_avg_return']*100:.4f}%")
-    print(f"超涨共振 (X1>1% 且 X2>0.5%):")
+    if resonance_stats["resonance_count"] > 0:
+        print(f"  收益标准差: {resonance_stats['resonance_std_return']*100:.4f}%")
+        print("  触发详情:")
+        for detail in resonance_stats["resonance_details"][:5]:  # 最多显示5条
+            print(
+                f"    {detail['date']} {detail['stock_code']}: Z_X1={detail['Z_X1']:.2f}, Z_X2={detail['Z_X2']:.2f}, Y={detail['Y']*100:.2f}%"
+            )
+    print(f"超涨共振 (Z_X1 > {-Z_THRESHOLD} 且 Z_X2 > {-Z_THRESHOLD}):")
     print(
         f"  触发次数: {resonance_stats['reverse_count']} ({resonance_stats['reverse_ratio']*100:.1f}%)"
     )
@@ -186,10 +201,11 @@ def run_batch_analysis(
 def main():
     """主函数"""
     logger.info("=" * 70)
-    logger.info("日内做T时序模型 - 相关性验证")
+    logger.info("日内做T时序模型 - Z-Score 标准化版本")
     logger.info(f"股票列表: {STOCK_CODES}")
     logger.info(f"观察时点: {OBSERVE_TIME} | 出场时点: {EXIT_TIME}")
-    logger.info(f"组合因子: Z = X1 + {X2_WEIGHT} * X2")
+    logger.info(f"组合因子: Z_final = Z_X1 + {X2_WEIGHT} * Z_X2")
+    logger.info(f"Z-Score 窗口: {ZSCORE_WINDOW} 天 | 共振阈值: {Z_THRESHOLD} 个标准差")
     logger.info("=" * 70)
 
     # 批量分析
@@ -199,6 +215,7 @@ def main():
         observe_time=OBSERVE_TIME,
         exit_time=EXIT_TIME,
         x2_weight=X2_WEIGHT,
+        zscore_window=ZSCORE_WINDOW,
     )
 
     # 保存结果
