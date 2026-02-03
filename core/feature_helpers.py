@@ -1,12 +1,8 @@
-"""
-特征计算模块
-
-负责计算日内做T相关的特征和标签
-"""
+"""特征计算核心逻辑"""
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 from loguru import logger
 
 
@@ -25,7 +21,8 @@ def calculate_intraday_features(
         df: 分钟数据 DataFrame，需包含 date, time, SecuCode, close, volume, amount 列
         observe_time: 观察时间点（如 "10:30"）
         exit_time: 出场时间点（如 "14:50"）
-        x2_weight: 组合因子中X2的权重（相对于X1）
+        x1_weight: X1 权重
+        x2_weight: X2 权重
         zscore_window: Z-Score 滚动窗口大小（天数）
 
     Returns:
@@ -46,17 +43,14 @@ def calculate_intraday_features(
         if len(morning_df) == 0:
             continue
 
-        # 获取观察时点的数据
-        obs_df = day_df[day_df["time"] == observe_time]
-        if len(obs_df) == 0:
+        # 获取观察时点到出场时点的数据
+        afternoon_df = day_df[
+            (day_df["time"] > observe_time) & (day_df["time"] <= exit_time)
+        ]
+        if len(afternoon_df) == 0:
             continue
 
-        # 获取出场时点的数据
-        exit_df = day_df[day_df["time"] == exit_time]
-        if len(exit_df) == 0:
-            continue
-
-        # 计算 VWAP (成交量加权平均价)
+        # 计算上午的 VWAP
         total_amount = morning_df["amount"].sum()
         total_volume = morning_df["volume"].sum()
         if total_volume == 0:
@@ -67,27 +61,27 @@ def calculate_intraday_features(
         twap = morning_df["close"].mean()
 
         # 获取观察时点的价格
-        price_obs = obs_df["close"].values[0]
+        price_obs = morning_df.iloc[-1]["close"]
 
         # 获取出场时点的价格
-        price_exit = exit_df["close"].values[0]
+        exit_price = afternoon_df.iloc[-1]["close"]
 
         # 计算原始特征
         x1 = price_obs / vwap - 1  # 价格偏离
         x2 = vwap / twap - 1  # 能量偏离
 
-        # 计算原始组合因子 Z = X1 + w2 * X2
+        # 计算原始组合因子 Z = X1 + x2_weight * X2
         z = x1 + x2_weight * x2
 
         # 计算标签
-        y = price_exit / price_obs - 1  # 下午收益
+        y = exit_price / price_obs - 1  # 下午收益
 
         results.append(
             {
                 "date": date,
                 "stock_code": stock_code,
                 "price_obs": price_obs,
-                "price_exit": price_exit,
+                "price_exit": exit_price,
                 "vwap": vwap,
                 "twap": twap,
                 "X1": x1,  # 价格偏离
@@ -126,8 +120,8 @@ def calculate_intraday_features(
         # 计算 Z-Score
         result_df[z_col] = (result_df[col] - result_df[mu_col]) / result_df[std_col]
 
-    # 计算标准化后的组合因子 Z_final = Z_X1 + w * Z_X2
-    result_df["Z_final"] = x1_weight * result_df["Z_X1"] + x2_weight * result_df["Z_X2"]
+    # 计算标准化后的组合因子 Z_final = Z_X1 + x2_weight * Z_X2
+    result_df["Z_final"] = result_df["Z_X1"] + x2_weight * result_df["Z_X2"]
 
     # 统计有效样本（排除 NaN）
     valid_mask = result_df["Z_X1"].notna() & result_df["Z_X2"].notna()
@@ -149,9 +143,9 @@ def calculate_intraday_features(
 
 def calculate_resonance_signals(
     df: pd.DataFrame,
-    z_threshold: float,  # Z-Score 阈值（标准差倍数）
-    y_profit_threshold: float,  # Y > 0.3%
-    use_zscore: bool = True,  # 是否使用 Z-Score 标准化特征
+    z_threshold: float,
+    y_profit_threshold: float,
+    use_zscore: bool = True,
 ) -> Dict:
     """
     计算共振信号统计（基于 Z-Score 标准化）
@@ -251,7 +245,7 @@ def calculate_resonance_signals(
 
 def calculate_quantile_analysis(
     df: pd.DataFrame,
-    feature_col: str = "X1",
+    feature_col: str = "Z_final",
     n_quantiles: int = 5,
 ) -> pd.DataFrame:
     """
@@ -259,25 +253,35 @@ def calculate_quantile_analysis(
 
     Args:
         df: 特征数据 DataFrame
-        feature_col: 特征列名
+        feature_col: 用于分组的特征列
         n_quantiles: 分位数数量
 
     Returns:
         DataFrame: 分位数分析结果
     """
-    labels = [f"Q{i+1}" for i in range(n_quantiles)]
-    df = df.copy()
-    df["quantile"] = pd.qcut(
-        df[feature_col], q=n_quantiles, labels=labels, duplicates="drop"
+    if feature_col not in df.columns:
+        logger.warning(f"特征列 {feature_col} 不存在")
+        return pd.DataFrame()
+
+    # 过滤有效样本
+    valid_df = df[df[feature_col].notna()].copy()
+    if len(valid_df) == 0:
+        return pd.DataFrame()
+
+    # 计算分位数
+    valid_df["quantile"] = pd.qcut(
+        valid_df[feature_col], q=n_quantiles, labels=False, duplicates="drop"
     )
 
-    analysis = (
-        df.groupby("quantile", observed=True)
-        .agg({"Y": ["mean", "std", "count"], feature_col: "mean"})
-        .round(6)
+    # 按分位数分组统计
+    result = valid_df.groupby("quantile").agg(
+        {
+            feature_col: "mean",
+            "Y": ["mean", "std", "count"],
+        }
     )
 
-    analysis.columns = ["Y_mean", "Y_std", "count", f"{feature_col}_mean"]
-    analysis = analysis.reset_index()
+    result.columns = [f"{feature_col}_mean", "Y_mean", "Y_std", "count"]
+    result = result.reset_index()
 
-    return analysis
+    return result

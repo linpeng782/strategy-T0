@@ -1,0 +1,32 @@
+# vwap-research 配置文件
+
+# 股票列表
+stock_codes:
+  - "002591"
+  - "002494"
+  - "002247"
+  - "300163"
+  - "300106"
+  - "300254"
+  - "603616"
+  - "300030"
+
+# 时间参数
+year: 2025
+observe_time: "10:30"  # 观察时间点
+exit_time: "14:50"     # 出场时间点
+
+# 特征计算参数
+feature_params:
+  x1_weight: 1.0       # X1 权重
+  x2_weight: 2.0       # X2 权重
+  zscore_window: 20    # Z-Score 滚动窗口（天数）
+
+# 共振信号参数
+resonance_params:
+  z_threshold: -1.0    # Z-Score 阈值（标准差倍数）
+  y_profit_threshold: 0.003  # Y > 0.3% 视为盈利
+
+# 数据路径
+data_dir: "/nfs/ofs-prediction/peterzhenglinpeng/backtest_engine/cache_dir/stock_data_1m_unadjusted"
+output_dir: "/nfs/volume-1593-1/peterzhenglinpeng/vwap-research/output"

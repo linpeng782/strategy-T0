@@ -34,7 +34,16 @@ from correlation_analyzer import (
 
 # ==================== 配置参数 ====================
 # 在这里修改要测试的股票代码列表
-STOCK_CODES = ["002591", "002494", "002247"]
+STOCK_CODES = [
+    "002591",
+    "002494",
+    "002247",
+    "300163",
+    "300106",
+    "300254",
+    "603616",
+    "300030",
+]
 
 # 时间参数
 YEAR = 2025
@@ -46,7 +55,7 @@ X2_WEIGHT = 2.0  # Z = X1 + X2_WEIGHT * X2
 
 # Z-Score 参数
 ZSCORE_WINDOW = 20  # Z-Score 滚动窗口（天数）
-Z_THRESHOLD = -2.0  # Z-Score 阈值（标准差倍数）
+Z_THRESHOLD = -1  # Z-Score 阈值（标准差倍数）
 Y_PROFIT_THRESHOLD = 0.003  # Y > 0.3% 视为盈利
 
 # 输出目录
