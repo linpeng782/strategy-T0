@@ -28,7 +28,10 @@ class ResonanceParams:
 class Config:
     """配置类"""
 
-    # 股票列表
+    # 指数代码（从指数获取成分股）
+    index_code: str = ""
+
+    # 股票列表（当 index_code 为空时使用）
     stock_codes: List[str] = field(default_factory=list)
 
     # 时间参数
@@ -72,6 +75,7 @@ def load_config(config_path: str = None) -> Config:
 
     # 解析配置
     config = Config(
+        index_code=raw_config.get("index_code", ""),
         stock_codes=raw_config.get("stock_codes", []),
         year=raw_config.get("year", 2025),
         observe_time=raw_config.get("observe_time", "10:30"),

@@ -19,16 +19,25 @@ class LoadMinuteData(BaseComponent):
         """
         logger.info("开始加载分钟数据...")
 
-        # 从配置获取参数
-        stock_codes = self.config.stock_codes
-        year = self.config.year
-
-        # 加载数据
-        df = self.data_loader.load_minute_data(stock_codes, year)
+        # 判断使用指数模式还是股票列表模式
+        index_code = self.config.index_code
+        if index_code:
+            # 指数模式：从指数获取成分股并与数据做交集
+            logger.info(f"使用指数模式: {index_code}")
+            df = self.data_loader.load_minute_data_with_index(index_code)
+            stock_codes = df["SecuCode"].unique().tolist() if len(df) > 0 else []
+        else:
+            # 股票列表模式
+            stock_codes = self.config.stock_codes
+            year = self.config.year
+            logger.info(f"使用股票列表模式: {len(stock_codes)} 只股票")
+            df = self.data_loader.load_minute_data(stock_codes, year)
 
         # 存入上下文
         context["minute_data"] = df
         context["stock_codes"] = stock_codes
 
-        logger.success(f"分钟数据加载完成: {len(df):,} 条记录")
+        logger.success(
+            f"分钟数据加载完成: {len(df):,} 条记录, {len(stock_codes)} 只股票"
+        )
         return context

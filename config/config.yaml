@@ -1,6 +1,14 @@
 # vwap-research 配置文件
 
-# 股票列表
+# 指数配置（从指数获取成分股）
+index_code: "932000.INDX"  # 中证2000指数，约2000只成分股
+# 其他可选指数:
+#   - "000300.XSHG"  # 沪深300
+#   - "000905.XSHG"  # 中证500
+#   - "000852.XSHG"  # 中证1000
+#   - "932000.INDX"  # 中证2000
+
+# 股票列表（当 index_code 为空时使用）
 stock_codes:
   - "002591"
   - "002494"
@@ -18,7 +26,7 @@ exit_time: "14:50"     # 出场时间点
 
 # 特征计算参数
 feature_params:
-  x1_weight: 1.0       # X1 权重
+  x1_weight: 0       # X1 权重
   x2_weight: 2.0       # X2 权重
   zscore_window: 20    # Z-Score 滚动窗口（天数）
 

@@ -44,6 +44,35 @@ def calculate_correlation(
     return result
 
 
+def calculate_feature_std_by_stock(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    按股票计算 X1, X2 的标准差
+
+    Args:
+        df: 特征数据 DataFrame
+
+    Returns:
+        DataFrame: 每只股票的 X1, X2 标准差
+    """
+    results = []
+
+    for stock_code, stock_df in df.groupby("stock_code"):
+        stock_code_str = str(stock_code).zfill(6)  # 补齐6位
+        results.append(
+            {
+                "stock_code": stock_code_str,
+                "X1_std": stock_df["X1"].std(),
+                "X2_std": stock_df["X2"].std(),
+                "X1_mean": stock_df["X1"].mean(),
+                "X2_mean": stock_df["X2"].mean(),
+                "n_samples": len(stock_df),
+            }
+        )
+
+    result_df = pd.DataFrame(results)
+    return result_df
+
+
 def analyze_by_stock(df: pd.DataFrame, use_zscore: bool = False) -> pd.DataFrame:
     """
     按股票分组分析相关性
@@ -128,25 +157,26 @@ def print_batch_summary(
     """
     print("\n" + "=" * 70)
     if use_zscore:
-        print("📊 批量测试汇总（Z-Score 标准化）")
+        print("📊 批量测试相关性汇总（Z-Score 标准化）")
     else:
-        print("📊 批量测试汇总")
+        print("📊 批量测试相关性汇总")
     print("=" * 70)
 
     if use_zscore:
         # Z-Score 模式
         print(
-            f"{'股票代码':<10} {'Z_X1-Y':>10} {'Z_X2-Y':>10} {'Z_final-Y':>10} {'Y波动':>10} {'样本数':>8}"
+            f"{'股票代码':>10} {'Z_X1-Y':>10} {'Z_X2-Y':>10} {'Z_final-Y':>12} {'Y波动':>10} {'样本数':>8}"
         )
         print("-" * 70)
 
         for _, row in stock_results.iterrows():
+            stock_code = str(row["stock_code"]).zfill(6)  # 补齐6位
             corr_x1 = row.get("corr_Z_X1_Y", 0)
             corr_x2 = row.get("corr_Z_X2_Y", 0)
             corr_z = row.get("corr_Z_final_Y", 0)
             y_std = row.get("Y_std", 0)
             print(
-                f"{row['stock_code']:<10} {corr_x1:>10.4f} {corr_x2:>10.4f} {corr_z:>10.4f} {y_std*100:>9.2f}% {int(row['n_samples']):>8}"
+                f"{stock_code:>10} {corr_x1:>10.4f} {corr_x2:>10.4f} {corr_z:>12.4f} {y_std*100:>9.2f}% {int(row['n_samples']):>8}"
             )
 
         print("-" * 70)
@@ -255,3 +285,10 @@ def print_resonance_summary(resonance_stats: Dict, z_threshold: float):
     )
     print(f"  胜率(Y<-0.3%): {resonance_stats['reverse_win_rate']*100:.1f}%")
     print(f"  平均收益: {resonance_stats['reverse_avg_return']*100:.4f}%")
+    if resonance_stats["reverse_count"] > 0:
+        print(f"  收益标准差: {resonance_stats['reverse_std_return']*100:.4f}%")
+        print("  触发详情:")
+        for detail in resonance_stats["reverse_details"][:5]:  # 最多显示5条
+            print(
+                f"    {detail['date']} {detail['stock_code']}: Z_X1={detail['Z_X1']:.2f}, Z_X2={detail['Z_X2']:.2f}, Y={detail['Y']*100:.2f}%"
+            )

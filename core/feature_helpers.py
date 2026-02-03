@@ -15,7 +15,7 @@ def calculate_intraday_features(
     zscore_window: int = 20,
 ) -> pd.DataFrame:
     """
-    计算日内特征和标签（含 Z-Score 标准化）
+    计算日内特征和标签（含 Z-Score 标准化）- 向量化版本
 
     Args:
         df: 分钟数据 DataFrame，需包含 date, time, SecuCode, close, volume, amount 列
@@ -32,68 +32,55 @@ def calculate_intraday_features(
         f"开始计算特征，观察时点: {observe_time}，出场时点: {exit_time}，Z-Score窗口: {zscore_window}天"
     )
 
-    results = []
+    # 向量化计算：按股票和日期分组聚合
+    # 1. 划分上午数据（开盘 ~ observe_time）
+    morning_mask = df["time"] <= observe_time
+    morning_df = df[morning_mask].copy()
 
-    # 按股票和日期分组
-    for (stock_code, date), day_df in df.groupby(["SecuCode", "date"]):
-        day_df = day_df.sort_values("TradingDay")
+    # 2. 划分下午数据（observe_time ~ exit_time）
+    afternoon_mask = (df["time"] > observe_time) & (df["time"] <= exit_time)
+    afternoon_df = df[afternoon_mask].copy()
 
-        # 获取观察时点之前的数据（开盘 ~ observe_time）
-        morning_df = day_df[day_df["time"] <= observe_time]
-        if len(morning_df) == 0:
-            continue
-
-        # 获取观察时点到出场时点的数据
-        afternoon_df = day_df[
-            (day_df["time"] > observe_time) & (day_df["time"] <= exit_time)
-        ]
-        if len(afternoon_df) == 0:
-            continue
-
-        # 计算上午的 VWAP
-        total_amount = morning_df["amount"].sum()
-        total_volume = morning_df["volume"].sum()
-        if total_volume == 0:
-            continue
-        vwap = total_amount / total_volume
-
-        # 计算 TWAP (时间加权平均价) - 每分钟close的简单平均
-        twap = morning_df["close"].mean()
-
-        # 获取观察时点的价格
-        price_obs = morning_df.iloc[-1]["close"]
-
-        # 获取出场时点的价格
-        exit_price = afternoon_df.iloc[-1]["close"]
-
-        # 计算原始特征
-        x1 = price_obs / vwap - 1  # 价格偏离
-        x2 = vwap / twap - 1  # 能量偏离
-
-        # 计算原始组合因子 Z = X1 + x2_weight * X2
-        z = x1 + x2_weight * x2
-
-        # 计算标签
-        y = exit_price / price_obs - 1  # 下午收益
-
-        results.append(
-            {
-                "date": date,
-                "stock_code": stock_code,
-                "price_obs": price_obs,
-                "price_exit": exit_price,
-                "vwap": vwap,
-                "twap": twap,
-                "X1": x1,  # 价格偏离
-                "X2": x2,  # 能量偏离
-                "Z": z,  # 组合因子
-                "Y": y,  # 下午收益
-                "morning_volume": total_volume,
-                "morning_amount": total_amount,
-            }
+    # 3. 上午聚合：VWAP, TWAP, 观察价格, 成交量, 成交额
+    morning_agg = (
+        morning_df.groupby(["SecuCode", "date"])
+        .agg(
+            morning_amount=("amount", "sum"),
+            morning_volume=("volume", "sum"),
+            twap=("close", "mean"),  # TWAP = 简单平均
+            price_obs=("close", "last"),  # 观察时点价格 = 最后一根K线收盘价
         )
+        .reset_index()
+    )
 
-    result_df = pd.DataFrame(results)
+    # 4. 下午聚合：出场价格
+    afternoon_agg = (
+        afternoon_df.groupby(["SecuCode", "date"])
+        .agg(
+            price_exit=("close", "last"),  # 出场价格 = 最后一根K线收盘价
+        )
+        .reset_index()
+    )
+
+    # 5. 合并上午和下午数据
+    result_df = morning_agg.merge(afternoon_agg, on=["SecuCode", "date"], how="inner")
+
+    # 6. 过滤无效数据（成交量为0）
+    result_df = result_df[result_df["morning_volume"] > 0].copy()
+
+    if len(result_df) == 0:
+        logger.warning("未计算出任何特征")
+        return pd.DataFrame()
+
+    # 7. 向量化计算特征
+    result_df["vwap"] = result_df["morning_amount"] / result_df["morning_volume"]
+    result_df["X1"] = result_df["price_obs"] / result_df["vwap"] - 1  # 价格偏离
+    result_df["X2"] = result_df["vwap"] / result_df["twap"] - 1  # 能量偏离
+    result_df["Z"] = result_df["X1"] + x2_weight * result_df["X2"]  # 组合因子
+    result_df["Y"] = result_df["price_exit"] / result_df["price_obs"] - 1  # 下午收益
+
+    # 8. 重命名列
+    result_df = result_df.rename(columns={"SecuCode": "stock_code"})
 
     if len(result_df) == 0:
         logger.warning("未计算出任何特征")

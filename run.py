@@ -8,6 +8,7 @@
 import os
 import sys
 from pathlib import Path
+from datetime import datetime
 from loguru import logger
 import warnings
 
@@ -17,6 +18,14 @@ warnings.filterwarnings("ignore")
 project_root = Path(__file__).parent.absolute()
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+
+# 配置日志输出到文件
+logs_dir = project_root / "logs"
+logs_dir.mkdir(parents=True, exist_ok=True)
+log_file = logs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logger.add(
+    log_file, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}", level="DEBUG"
+)
 
 from config.config import load_config
 from services.data_loader import DataLoader
@@ -40,7 +49,10 @@ def main():
     # 2. 打印启动信息
     logger.info("=" * 70)
     logger.info("日内做T时序模型 - Z-Score 标准化版本（管道式架构）")
-    logger.info(f"股票列表: {config.stock_codes}")
+    if config.index_code:
+        logger.info(f"指数模式: {config.index_code}")
+    else:
+        logger.info(f"股票列表模式: {len(config.stock_codes)} 只股票")
     logger.info(f"观察时点: {config.observe_time} | 出场时点: {config.exit_time}")
     logger.info(
         f"组合因子: Z_final = {config.feature_params.x1_weight} * Z_X1 + {config.feature_params.x2_weight} * Z_X2"
