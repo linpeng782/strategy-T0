@@ -51,9 +51,7 @@ def load_5m_data(year: int) -> pd.DataFrame:
     df = pd.read_pickle(pkl_path)
     n_stocks = df["SecuCode"].nunique()
     n_days = df["date"].nunique()
-    logger.success(
-        f"加载完成: {len(df):,} 个Bar, {n_stocks} 只股票, {n_days} 个交易日"
-    )
+    logger.success(f"加载完成: {len(df):,} 个Bar, {n_stocks} 只股票, {n_days} 个交易日")
     return df
 
 
@@ -107,18 +105,14 @@ def calculate_features_and_labels(df: pd.DataFrame) -> pd.DataFrame:
     df["V_rest"] = (rest_amount / rest_volume).replace([np.inf, -np.inf], np.nan)
     df["Y"] = df["next_vwap_5m"] / df["V_rest"]
 
-    # Y_15m: 买入Bar之后3个Bar（15分钟）的VWAP
-    cum_amt_s4 = grp["cum_amount"].shift(-4)
-    cum_vol_s4 = grp["cum_volume"].shift(-4)
-    next_15m_amount = cum_amt_s4 - cum_amt_s1
-    next_15m_volume = cum_vol_s4 - cum_vol_s1
-    df["V_next_15m"] = (next_15m_amount / next_15m_volume).replace(
-        [np.inf, -np.inf], np.nan
-    )
-    df["Y_15m"] = df["next_vwap_5m"] / df["V_next_15m"]
-
-    # Y_30m ~ Y_120m: 通用公式
-    for minutes, label_suffix in [(30, "30m"), (60, "60m"), (90, "90m"), (120, "120m")]:
+    # Y_15m ~ Y_120m: 不同时间维度的标签（通用公式）
+    for minutes, label_suffix in [
+        (15, "15m"),
+        (30, "30m"),
+        (60, "60m"),
+        (90, "90m"),
+        (120, "120m"),
+    ]:
         offset = minutes // 5 + 1
         cum_amt_sN = grp["cum_amount"].shift(-offset)
         cum_vol_sN = grp["cum_volume"].shift(-offset)
@@ -171,9 +165,7 @@ def calculate_zscore(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
         ]
 
         # 组合因子
-        group_df["Z_final"] = (
-            2.5 * group_df["X2_zscore"] - 0.5 * group_df["X1_zscore"]
-        )
+        group_df["Z_final"] = 2.5 * group_df["X2_zscore"] - 0.5 * group_df["X1_zscore"]
 
         result_list.append(group_df)
 

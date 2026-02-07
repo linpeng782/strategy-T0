@@ -37,13 +37,13 @@ YEAR = 2025
 
 # 回测参数
 COST_RATE = 0.0015  # 双边交易成本（佣金+印花税+滑点）
-HOLD_BARS_LIST = [24, 30, 36]  # 持仓Bar数
+HOLD_BARS_LIST = [6, 12, 24]  # 持仓Bar数
 THRESHOLD_LIST = [-2.0, -1.5, -1.0, -0.5]  # X2_zscore 阈值
 SIGNAL_COL = "X2_zscore"  # 信号列
 
 # 交易时间窗口（剔除开盘和尾盘）
-TRADE_START = "09:45"
-TRADE_END = "14:30"
+TRADE_START = "10:30"
+TRADE_END = "14:00"
 
 
 def load_features(year: int) -> pd.DataFrame:
@@ -56,6 +56,8 @@ def load_features(year: int) -> pd.DataFrame:
 
     logger.info(f"加载特征数据: {pkl_path}")
     df = pd.read_pickle(pkl_path)
+    # 显式排序，确保 groupby+shift 的正确性
+    df = df.sort_values(["SecuCode", "date", "entry_time"]).reset_index(drop=True)
     logger.success(f"加载完成: {len(df):,} 行")
     return df
 
@@ -107,8 +109,14 @@ def run_single_backtest(
     trades = df.loc[
         df_buy.index,
         [
-            "SecuCode", "date", "entry_time", "close",
-            signal_col, "buy_price", "sell_price", "sell_time",
+            "SecuCode",
+            "date",
+            "entry_time",
+            "close",
+            signal_col,
+            "buy_price",
+            "sell_price",
+            "sell_time",
         ],
     ].copy()
 
@@ -119,9 +127,9 @@ def run_single_backtest(
         return pd.DataFrame()
 
     # 6. 计算收益
-    trades["raw_ret"] = (
-        (trades["sell_price"] - trades["buy_price"]) / trades["buy_price"]
-    )
+    trades["raw_ret"] = (trades["sell_price"] - trades["buy_price"]) / trades[
+        "buy_price"
+    ]
     trades["net_ret"] = trades["raw_ret"] - cost_rate
 
     return trades
@@ -143,9 +151,7 @@ def analyze_trades(trades: pd.DataFrame, label: str) -> dict:
     # 按日汇总（假设每天等权分配）
     daily_ret = trades.groupby("date")["net_ret"].mean()
     sharpe = (
-        daily_ret.mean() / daily_ret.std() * np.sqrt(252)
-        if daily_ret.std() > 0
-        else 0
+        daily_ret.mean() / daily_ret.std() * np.sqrt(252) if daily_ret.std() > 0 else 0
     )
     max_dd = (daily_ret.cumsum() - daily_ret.cumsum().cummax()).min()
 
@@ -258,9 +264,7 @@ def print_report(all_results: list):
 
 def plot_equity_curves(all_results: list):
     """绘制资金曲线"""
-    valid_results = [
-        r for r in all_results if r["n_trades"] > 0 and "daily_ret" in r
-    ]
+    valid_results = [r for r in all_results if r["n_trades"] > 0 and "daily_ret" in r]
 
     if not valid_results:
         logger.warning("无有效结果可绘图")
@@ -308,8 +312,12 @@ def plot_equity_curves(all_results: list):
             val = sharpe_matrix[i, j]
             if not np.isnan(val):
                 axes[1].text(
-                    j, i, f"{val:.2f}",
-                    ha="center", va="center", fontsize=10,
+                    j,
+                    i,
+                    f"{val:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=10,
                     color="black" if abs(val) < 1.5 else "white",
                 )
 
