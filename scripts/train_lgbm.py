@@ -39,22 +39,24 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 建模参数
 Z_THRESHOLD = -1.5  # 潜在买入信号阈值
-TARGET_PROFIT_BP = 30  # 止盈目标（60bp）
+TARGET_PROFIT_BP = 20  # 止盈目标（60bp）
 STOP_LOSS_BP = 40  # 止损目标（40bp）
 TRAIN_RATIO = 0.8  # 训练集比例
 
-# 特征列表（V3增强版：新增大盘环境特征 mkt_oversold_ratio, mkt_avg_z）
+# 特征列表（V6完整版：12个核心特征，包含大盘特征、个股特征、相对强度、波动率）
 ML_FEATURES = [
-    "X1_zscore",
-    "X2_zscore",
-    "Z_final",
-    "time_val",
-    "yesterday_range",
-    "vol_burst",
-    "z_final_slope",
-    "x1_slope",
-    "mkt_oversold_ratio",
-    "mkt_avg_z",
+    "mkt_oversold_ratio",  # 大盘超跌占比
+    "mkt_avg_x1",  # 大盘价格偏离
+    "mkt_avg_z",  # 大盘引力中枢
+    "mkt_ret_15m",  # 大盘15分钟动量
+    "time_val",  # 时间特征
+    "yesterday_range",  # 昨日波动率
+    "X1_zscore",  # 个股价格偏离
+    "vol_burst",  # 成交量爆发力
+    "x1_slope",  # 价格动量斜率
+    "Z_final",  # 个股引力
+    "relative_z",  # 个股相对强度（独立超跌）
+    "volatility_ratio",  # 波动率放大比
 ]
 
 # 设置字体
@@ -111,14 +113,14 @@ def prepare_modeling_data(df: pd.DataFrame) -> tuple:
         & (df["time_str"] < "14:15")  # 剔除尾盘
         & np.isfinite(df["Z_final"])
         & np.isfinite(df["X1_zscore"])
-        & np.isfinite(df["X2_zscore"])
         & np.isfinite(df["future_high"])
         & np.isfinite(df["future_low"])
-        & np.isfinite(df["vol_burst"])  # 新增特征
-        & np.isfinite(df["z_final_slope"])  # 新增特征
-        & np.isfinite(df["x1_slope"])  # 新增特征
-        & np.isfinite(df["mkt_oversold_ratio"])  # 大盘环境特征
-        & np.isfinite(df["mkt_avg_z"])  # 大盘环境特征
+        & np.isfinite(df["vol_burst"])
+        & np.isfinite(df["x1_slope"])
+        & np.isfinite(df["mkt_oversold_ratio"])
+        & np.isfinite(df["mkt_avg_z"])
+        & np.isfinite(df["mkt_ret_15m"])  # 大盘动量特征
+        & np.isfinite(df["mkt_avg_x1"])  # 大盘价格偏离特征
     ].copy()
 
     logger.info(f"筛选后样本数: {len(df_model):,}")
@@ -180,14 +182,15 @@ def train_lgbm(df: pd.DataFrame, features: list) -> tuple:
         "metric": "auc",
         "boosting_type": "gbdt",
         "learning_rate": 0.01,  # 降慢学习速度，学得更细
-        "num_leaves": 31,  # 增加叶子数，捕捉更复杂的组合
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.7,
+        "num_leaves": 63,  # 增加叶子数，捕捉更复杂的组合
+        "max_depth": 7,
+        "feature_fraction": 0.6,
+        "bagging_fraction": 0.8,
         "bagging_freq": 5,
         "is_unbalance": True,  # 自动处理正负样本不平衡
-        "lambda_l1": 0.5,  # L1 正则，防止特征权重过大
-        "lambda_l2": 0.5,  # L2 正则，防止过拟合
-        "min_data_in_leaf": 150,  # 每个叶子最少150个样本，防止过拟合
+        "lambda_l1": 0.1,  # L1 正则，防止特征权重过大
+        "lambda_l2": 0.1,  # L2 正则，防止过拟合
+        "min_data_in_leaf": 20,  # 每个叶子最少150个样本，防止过拟合
         "seed": 42,
         "verbose": -1,
     }

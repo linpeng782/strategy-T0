@@ -3,6 +3,14 @@
 
 目标：验证老板的直觉 —— X2（能量偏差）能否预测"现在买入是否划算"
 
+决策流程（以站在10:00为例）：
+  1. bar_time=10:00（ceil）表示 09:56~10:00 的数据，在10:00时刻全部可用
+  2. 特征(X1, X2, Z-Score)用截至当前Bar（含）的累积数据 → 无未来函数
+  3. 决定是否在下一个Bar(10:01~10:05)以VWAP买入
+  4. V_5m = 下一个Bar的VWAP（买入成本，上帝视角）
+  5. V_rest = 下一个Bar之后到收盘的VWAP（上帝视角）
+  6. Y = V_5m / V_rest，Y < 1 说明买便宜了
+
 逻辑：
 - X2_zscore 越大（高位放量） → V_5m 应该比 V_rest 贵 → Y > 1
 - X2_zscore 越小（低位放量） → V_5m 应该比 V_rest 便宜 → Y < 1
@@ -66,14 +74,20 @@ def load_minute_data(stock_codes: list, year: int) -> pd.DataFrame:
 
 def aggregate_to_5min_bars(df: pd.DataFrame) -> pd.DataFrame:
     """
-    将1分钟数据聚合为5分钟Bar
+    将1分钟数据聚合为5分钟Bar，显式输出两套列：
 
-    每个5分钟Bar包含：open, high, low, close, volume, amount, vwap
+    当前Bar数据（用于特征，在bar_time时刻全部可用）：
+      - volume, amount, close, cum_volume, cum_amount, cum_vwap, cum_twap
+    下一个Bar数据（用于标签，上帝视角）：
+      - next_vwap_5m → 下一个Bar的VWAP（买入成本）
+
+    bar_time 使用 ceil（Bar的结束时间），与米筐get_price()一致
+    语义：bar_time=10:00 表示 09:56~10:00 的数据，在10:00时刻全部可用
     """
     logger.info("聚合为5分钟Bar...")
 
-    # 创建5分钟时间标签（向下取整到5分钟边界）
-    df["bar_time"] = pd.to_datetime(df["TradingDay"]).dt.floor("5min")
+    # 创建5分钟时间标签（向上取整到5分钟边界，与米筐一致）
+    df["bar_time"] = pd.to_datetime(df["TradingDay"]).dt.ceil("5min")
 
     # 按 股票 + 日期 + 5分钟Bar 聚合
     agg_df = (
@@ -91,9 +105,33 @@ def aggregate_to_5min_bars(df: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
 
-    # 计算5分钟VWAP
+    # 先确保按股票+日期+时间排序
+    agg_df = agg_df.sort_values(["SecuCode", "date", "bar_time"]).reset_index(drop=True)
+    grp_keys = ["SecuCode", "date"]
+
+    # 当前Bar的VWAP
     agg_df["vwap_5m"] = agg_df["amount"] / agg_df["volume"]
     agg_df["vwap_5m"] = agg_df["vwap_5m"].replace([np.inf, -np.inf], np.nan)
+
+    # ========== 当前Bar的累积数据（用于特征，在bar_time时刻全部可用）==========
+    # 截至当前Bar（含）的累积成交量/成交额
+    agg_df["cum_volume"] = agg_df.groupby(grp_keys)["volume"].cumsum()
+    agg_df["cum_amount"] = agg_df.groupby(grp_keys)["amount"].cumsum()
+
+    # 截至当前Bar的累积VWAP
+    agg_df["cum_vwap"] = agg_df["cum_amount"] / agg_df["cum_volume"]
+    agg_df["cum_vwap"] = agg_df["cum_vwap"].replace([np.inf, -np.inf], np.nan)
+
+    # 截至当前Bar的累积TWAP（close的累积均值）
+    agg_df["cum_twap"] = (
+        agg_df.groupby(grp_keys)["close"]
+        .expanding()
+        .mean()
+        .reset_index(level=[0, 1], drop=True)
+    )
+
+    # ========== 下一个Bar的VWAP（用于标签，上帝视角）==========
+    agg_df["next_vwap_5m"] = agg_df.groupby(grp_keys)["vwap_5m"].shift(-1)
 
     # 提取时间字符串（用于后续筛选）
     agg_df["time_str"] = agg_df["bar_time"].dt.strftime("%H:%M")
@@ -102,78 +140,57 @@ def aggregate_to_5min_bars(df: pd.DataFrame) -> pd.DataFrame:
     return agg_df
 
 
-def calculate_cumulative_vwap(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_features_and_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
-    计算每个5分钟Bar的累积VWAP和TWAP
+    计算特征和标签
 
-    返回：每个Bar时刻的
-    - cum_vwap: 从开盘到当前的累积VWAP
-    - cum_twap: 从开盘到当前的累积TWAP（收盘价简单平均）
+    特征（无未来函数，ceil语义下当前Bar数据在bar_time时刻已全部可用）：
+      - X1 = close / cum_vwap - 1（当前Bar收盘价 vs 截至当前Bar的累积VWAP）
+      - X2 = cum_vwap / cum_twap - 1（截至当前Bar的累积VWAP vs 累积TWAP）
+    标签（上帝视角）：
+      - next_vwap_5m: 下一个Bar的VWAP（决策后买入的成本）
+      - V_rest: 下一个Bar之后到收盘的VWAP
+      - Y = next_vwap_5m / V_rest
     """
-    logger.info("计算累积VWAP和TWAP...")
+    logger.info("计算特征和标签...")
 
-    result_list = []
+    # ========== 特征部分（当前Bar数据在bar_time时刻已全部可用，无未来函数）==========
+    df["X1"] = df["close"] / df["cum_vwap"] - 1
+    df["X2"] = df["cum_vwap"] / df["cum_twap"] - 1
 
-    for (stock, date), day_df in df.groupby(["SecuCode", "date"]):
-        day_df = day_df.sort_values("bar_time").copy()
+    # ========== 标签部分（上帝视角）==========
+    # V_rest: 下一个Bar之后到收盘的VWAP
+    # 先算截至下一个Bar（含）的累积量，然后用全天总量减去
+    grp_keys = ["SecuCode", "date"]
+    # 截至下一个Bar的累积量 = 截至当前Bar的累积量 + 下一个Bar的量
+    next_cum_amount = df["cum_amount"] + df.groupby(grp_keys)["amount"].shift(
+        -1
+    ).fillna(0)
+    next_cum_volume = df["cum_volume"] + df.groupby(grp_keys)["volume"].shift(
+        -1
+    ).fillna(0)
+    total_amount = df.groupby(grp_keys)["amount"].transform("sum")
+    total_volume = df.groupby(grp_keys)["volume"].transform("sum")
 
-        # 累积成交量和成交额
-        day_df["cum_volume"] = day_df["volume"].cumsum()
-        day_df["cum_amount"] = day_df["amount"].cumsum()
+    rest_amount = total_amount - next_cum_amount
+    rest_volume = total_volume - next_cum_volume
+    df["V_rest"] = (rest_amount / rest_volume).replace([np.inf, -np.inf], np.nan)
 
-        # 累积VWAP = 累积成交额 / 累积成交量
-        day_df["cum_vwap"] = day_df["cum_amount"] / day_df["cum_volume"]
+    # Y = next_vwap_5m / V_rest（下一个Bar买入成本 vs 之后的均价）
+    df["Y"] = df["next_vwap_5m"] / df["V_rest"]
 
-        # 累积TWAP = 收盘价的累积平均
-        day_df["cum_twap"] = day_df["close"].expanding().mean()
+    # 过滤：每天第一个Bar的cum_twap可能不稳定，每天最后两个Bar的标签无意义
+    valid = (
+        df["cum_vwap"].notna()
+        & df["cum_twap"].notna()
+        & df["next_vwap_5m"].notna()
+        & df["V_rest"].notna()
+        & df["Y"].notna()
+        & (rest_volume > 0)
+    )
+    result = df[valid].copy()
 
-        # 计算 X1 和 X2
-        day_df["X1"] = day_df["close"] / day_df["cum_vwap"] - 1
-        day_df["X2"] = day_df["cum_vwap"] / day_df["cum_twap"] - 1
-
-        result_list.append(day_df)
-
-    result = pd.concat(result_list, ignore_index=True)
-    logger.success(f"累积VWAP计算完成")
-    return result
-
-
-def calculate_remaining_vwap(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    计算 V_rest：从当前Bar之后到收盘的VWAP
-
-    这是"上帝视角"标签，实盘时无法获取
-    """
-    logger.info("计算 remaining_vwap (V_rest)...")
-
-    result_list = []
-
-    for (stock, date), day_df in df.groupby(["SecuCode", "date"]):
-        day_df = day_df.sort_values("bar_time").copy()
-
-        # 全天总成交量和成交额
-        total_volume = day_df["volume"].sum()
-        total_amount = day_df["amount"].sum()
-
-        # 对于每个Bar，计算剩余时间的VWAP
-        # V_rest(t) = (total_amount - cum_amount(t)) / (total_volume - cum_volume(t))
-        day_df["rest_volume"] = total_volume - day_df["cum_volume"]
-        day_df["rest_amount"] = total_amount - day_df["cum_amount"]
-
-        day_df["V_rest"] = day_df["rest_amount"] / day_df["rest_volume"]
-        day_df["V_rest"] = day_df["V_rest"].replace([np.inf, -np.inf], np.nan)
-
-        # 计算 Y = V_5m / V_rest
-        day_df["Y"] = day_df["vwap_5m"] / day_df["V_rest"]
-
-        result_list.append(day_df)
-
-    result = pd.concat(result_list, ignore_index=True)
-
-    # 过滤掉最后一个Bar（V_rest 无意义）
-    result = result[result["rest_volume"] > 0]
-
-    logger.success(f"V_rest 计算完成, 有效样本: {len(result):,}")
+    logger.success(f"特征和标签计算完成, 有效样本: {len(result):,}")
     return result
 
 
@@ -331,7 +348,7 @@ def print_report(stats: dict, df: pd.DataFrame):
     print("-" * 70)
     time_corrs = stats["time_corrs"].sort_index()
     # 只显示部分关键时间点
-    key_times = ["09:35", "10:00", "10:30", "11:00", "13:05", "13:30", "14:00", "14:30"]
+    key_times = ["09:40", "10:00", "10:30", "11:00", "13:05", "13:30", "14:00", "14:30"]
     print(f"{'时间点':<10} {'X2与Y相关性':>12} {'样本数':>10}")
     for t in key_times:
         if t in time_corrs.index:
@@ -377,22 +394,19 @@ def main():
     # 2. 聚合为5分钟Bar
     df_5m = aggregate_to_5min_bars(df_1m)
 
-    # 3. 计算累积VWAP和特征
-    df_5m = calculate_cumulative_vwap(df_5m)
+    # 3. 计算特征（无未来函数）和标签（上帝视角）
+    df_5m = calculate_features_and_labels(df_5m)
 
-    # 4. 计算 V_rest 和 Y
-    df_5m = calculate_remaining_vwap(df_5m)
-
-    # 5. 计算 Z-Score
+    # 4. 计算 Z-Score
     df_5m = calculate_zscore(df_5m, window=ZSCORE_WINDOW)
 
-    # 6. 分析相关性
+    # 5. 分析相关性
     stats = analyze_correlation(df_5m)
 
-    # 7. 打印报告
+    # 6. 打印报告
     print_report(stats, df_5m)
 
-    # 8. 保存结果
+    # 7. 保存结果
     output_file = OUTPUT_DIR / "x2_vrest_correlation_validation.csv"
     df_5m.to_csv(output_file, index=False)
     logger.success(f"结果已保存至: {output_file}")

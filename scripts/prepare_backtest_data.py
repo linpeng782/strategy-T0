@@ -172,8 +172,8 @@ def calculate_features_vectorized(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def calculate_zscore_vectorized(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
-    """向量化计算Z-Score"""
-    logger.info(f"计算 Z-Score (窗口={window}天)...")
+    """向量化计算Z-Score，并进行去极值处理"""
+    logger.info(f"计算 Z-Score 并进行去极值处理 (窗口={window}天)...")
 
     df = df.sort_values(["SecuCode", "bar_time"]).copy()
     df["time_str"] = df["bar_time"].dt.strftime("%H:%M")
@@ -191,11 +191,19 @@ def calculate_zscore_vectorized(df: pd.DataFrame, window: int = 20) -> pd.DataFr
     df["X1_mean"] = df.groupby(group_keys)["X1"].transform(rolling_mean_shifted)
     df["X1_std"] = df.groupby(group_keys)["X1"].transform(rolling_std_shifted)
 
-    df["X2_zscore"] = (df["X2"] - df["X2_mean"]) / df["X2_std"]
-    df["X1_zscore"] = (df["X1"] - df["X1_mean"]) / df["X1_std"]
-    df["Z_final"] = df["X2_zscore"] - 0.5 * df["X1_zscore"]
+    # 计算 Z-Score 并进行去极值处理 (Clipping)，限制在 [-8, 8] 个标准差内，防止数值爆炸
+    epsilon = 1e-6
+    df["X2_zscore"] = ((df["X2"] - df["X2_mean"]) / (df["X2_std"] + epsilon)).clip(
+        -8, 8
+    )
+    df["X1_zscore"] = ((df["X1"] - df["X1_mean"]) / (df["X1_std"] + epsilon)).clip(
+        -8, 8
+    )
 
-    logger.success("Z-Score 计算完成")
+    # 基于截断后的 Z 值计算 Z_final，并再次截断
+    df["Z_final"] = (df["X2_zscore"] - 0.5 * df["X1_zscore"]).clip(-10, 10)
+
+    logger.success("Z-Score 计算及去极值完成")
     return df
 
 
@@ -296,17 +304,38 @@ def calculate_ml_features(df: pd.DataFrame, vol_window: int = 20) -> pd.DataFram
     logger.info("  - 计算价格动量斜率 (x1_slope)...")
     df["x1_slope"] = df.groupby(["SecuCode", "date"])["X1_zscore"].diff()
 
-    logger.success("机器学习增强特征计算完成: vol_burst, z_final_slope, x1_slope")
+    # 4. 个股相对强度 (relative_z)
+    # 逻辑：个股引力减去大盘引力，识别"独立超跌"
+    logger.info("  - 计算个股相对强度 (relative_z)...")
+    df["relative_z"] = df["Z_final"] - df["mkt_avg_z"]
+
+    # 5. 波动率放大比 (volatility_ratio)
+    # 逻辑：当前振幅 / 历史平均振幅
+    logger.info("  - 计算波动率放大比 (volatility_ratio)...")
+    df["curr_range"] = (df["high"] - df["low"]) / df["close"]
+    df["range_hist_mean"] = df.groupby(["SecuCode", "time_str"])[
+        "curr_range"
+    ].transform(lambda x: x.rolling(window=vol_window, min_periods=5).mean().shift(1))
+    df["volatility_ratio"] = (df["curr_range"] / (df["range_hist_mean"] + 1e-6)).clip(
+        0, 5
+    )
+    df = df.drop(columns=["curr_range", "range_hist_mean"])
+
+    logger.success(
+        "机器学习增强特征计算完成: vol_burst, z_final_slope, x1_slope, relative_z, volatility_ratio"
+    )
     return df
 
 
 def calculate_market_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     """
-    计算全市场环境特征：市场超跌占比和大盘引力中枢
+    计算全市场环境特征：市场超跌占比、大盘引力中枢、大盘动量
 
     新增特征：
     1. mkt_oversold_ratio - 全市场超跌占比：当前时刻有多少比例的股票 Z_final < -1.0
     2. mkt_avg_z - 大盘整体的引力中枢：全市场 Z_final 的平均值
+    3. mkt_ret_15m - 大盘过去15分钟（3个Bar）的累积收益率
+    4. mkt_avg_x1 - 大盘价格偏离均值：全市场 X1_zscore 的平均值
     """
     logger.info("计算全市场环境特征 (Market Sentiment)...")
 
@@ -323,10 +352,43 @@ def calculate_market_sentiment(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("  - 计算大盘引力中枢 (mkt_avg_z)...")
     df["mkt_avg_z"] = df.groupby(["date", "time_str"])["Z_final"].transform("mean")
 
-    # 4. 清理中间变量
-    df = df.drop(columns=["is_oversold_signal"])
+    # 4. 计算大盘过去15分钟（3个Bar）的累积收益率
+    # 注意：必须先算出大盘的唯一时序，在"纯大盘时序"上做 rolling，再 map 回主表
+    # 避免跨股票污染（不同股票交界处的 rolling 会把不同股票的收益率加在一起）
+    logger.info("  - 计算大盘动量 (mkt_ret_15m)...")
+    # 先计算个股5分钟收益率
+    df = df.sort_values(["SecuCode", "date", "bar_time"])
+    df["indiv_ret"] = df.groupby(["SecuCode", "date"])["close"].pct_change()
 
-    logger.success("大盘环境特征计算完成: mkt_oversold_ratio, mkt_avg_z")
+    # 算出全市场每个时间点的平均收益（这代表了大盘的变动）
+    mkt_series = df.groupby(["date", "time_str"])["indiv_ret"].mean().reset_index()
+    mkt_series = mkt_series.sort_values(["date", "time_str"])
+
+    # 在这个"纯大盘时序"上做 rolling，确保不会跨股票污染
+    mkt_series["mkt_ret_15m"] = mkt_series.groupby("date")["indiv_ret"].transform(
+        lambda x: x.rolling(window=3, min_periods=1).sum()
+    )
+
+    # 去极值处理，防止极少数崩盘时刻的巨大负值把模型带偏
+    mkt_series["mkt_ret_15m"] = mkt_series["mkt_ret_15m"].clip(-0.02, 0.02)
+
+    # 将算好的大盘动量 map 回主表
+    df = df.merge(
+        mkt_series[["date", "time_str", "mkt_ret_15m"]],
+        on=["date", "time_str"],
+        how="left",
+    )
+
+    # 5. 计算大盘价格偏离均值 (全市场 X1_zscore 的平均值)
+    logger.info("  - 计算大盘价格偏离 (mkt_avg_x1)...")
+    df["mkt_avg_x1"] = df.groupby(["date", "time_str"])["X1_zscore"].transform("mean")
+
+    # 6. 清理中间变量
+    df = df.drop(columns=["is_oversold_signal", "indiv_ret"])
+
+    logger.success(
+        "大盘环境特征计算完成: mkt_oversold_ratio, mkt_avg_z, mkt_ret_15m, mkt_avg_x1"
+    )
     return df
 
 
@@ -428,11 +490,12 @@ def main():
     # 8. 添加时间数值特征
     df_5m = add_time_val(df_5m)
 
-    # 9. 计算机器学习增强特征 (vol_burst, z_final_slope, x1_slope)
-    df_5m = calculate_ml_features(df_5m, vol_window=ZSCORE_WINDOW)
-
-    # 10. 计算全市场环境特征 (mkt_oversold_ratio, mkt_avg_z)
+    # 9. 计算全市场环境特征 (mkt_oversold_ratio, mkt_avg_z, mkt_ret_15m, mkt_avg_x1)
+    # 注意：必须先计算大盘特征，因为 calculate_ml_features 中的 relative_z 依赖 mkt_avg_z
     df_5m = calculate_market_sentiment(df_5m)
+
+    # 10. 计算机器学习增强特征 (vol_burst, z_final_slope, x1_slope, relative_z, volatility_ratio)
+    df_5m = calculate_ml_features(df_5m, vol_window=ZSCORE_WINDOW)
 
     # 11. 计算每日基础收益率
     daily_returns = calculate_daily_returns(df_5m)

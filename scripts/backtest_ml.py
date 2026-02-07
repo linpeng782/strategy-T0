@@ -41,16 +41,29 @@ MODEL_PATH = Path(
 Z_LOWER = -5.0
 Z_UPPER = -1.5
 HOLDING_PERIOD = 60
-TRADE_COST = 0.0002 + 0.0005 + 0.0008  # 20bp
+TRADE_COST = 0.0015  # 15bp（与notebook保持一致）
 
 # 止盈止损参数（与模型训练保持一致）
-TAKE_PROFIT_BP = 60  # 止盈目标
-STOP_LOSS_BP = 40  # 止损目标
-T_LEVERAGE = 0.5
+TAKE_PROFIT_BP = 70  # 止盈目标 +80bp
+STOP_LOSS_BP = 40  # 止损目标 -40bp
+T_LEVERAGE = 0.5  # 做T资金占底仓一半
 
-# ML参数
-ML_FEATURES = ["X1_zscore", "X2_zscore", "Z_final", "time_val", "yesterday_range"]
-ML_PROB_THRESHOLD = 0.10  # 概率阈值（根据模型输出分布调整）
+# ML参数（V6完整版：12个特征，与train_lgbm.py保持一致）
+ML_FEATURES = [
+    "mkt_oversold_ratio",  # 大盘超跌占比
+    "mkt_avg_x1",  # 大盘价格偏离
+    "mkt_avg_z",  # 大盘引力中枢
+    "mkt_ret_15m",  # 大盘15分钟动量
+    "time_val",  # 时间特征
+    "yesterday_range",  # 昨日波动率
+    "X1_zscore",  # 个股价格偏离
+    "vol_burst",  # 成交量爆发力
+    "x1_slope",  # 价格动量斜率
+    "Z_final",  # 个股引力
+    "relative_z",  # 个股相对强度（独立超跌）
+    "volatility_ratio",  # 波动率放大比
+]
+ML_PROB_THRESHOLD = 0.3  # 概率阈值（根据概率分布中位数0.475调整，取中位数以上）
 
 # 设置字体
 plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
@@ -110,8 +123,16 @@ def add_ml_scores(df: pd.DataFrame, model) -> pd.DataFrame:
     """为每个Bar添加ML概率分数"""
     logger.info("计算 ML 信号概率分数...")
 
-    # 添加时间特征
-    df["time_val"] = df["bar_time"].dt.hour + df["bar_time"].dt.minute / 60.0
+    # 检查特征是否存在
+    missing_features = [f for f in ML_FEATURES if f not in df.columns]
+    if missing_features:
+        logger.warning(f"缺失特征: {missing_features}")
+        # 如果time_val不存在，则计算
+        if "time_val" in missing_features:
+            df["time_val"] = df["bar_time"].dt.hour + df["bar_time"].dt.minute / 60.0
+            missing_features.remove("time_val")
+        if missing_features:
+            raise ValueError(f"缺失必要特征: {missing_features}")
 
     # 提取特征矩阵
     X = df[ML_FEATURES].copy()
@@ -137,9 +158,15 @@ def run_backtest_comparison(
     df: pd.DataFrame, daily_returns: pd.DataFrame, prob_threshold: float
 ):
     """
-    运行对比回测：规则版 vs ML版
+    运行对比回测：规则版 vs ML版（进攻型动态杠杆 V3）
+
+    动态杠杆逻辑（3档分级，进攻型）：
+    - ml_prob >= 0.50: 杠杆 1.2（顶级+优质信号，超额押注）
+    - ml_prob >= 0.46: 杠杆 0.8（中等信号，主力头寸）
+    - ml_prob >= 0.43: 杠杆 0.4（边缘信号，贡献频率）
+    - ml_prob < 0.43:  杠杆 0.0（垃圾信号，绝对拦截）
     """
-    logger.info(f"运行对比回测 (ML阈值={prob_threshold})...")
+    logger.info(f"运行对比回测（进攻型动态杠杆版）...")
 
     # 1. 昨日高波动滤网
     vol_threshold = df["yesterday_range"].quantile(0.9)
@@ -157,17 +184,43 @@ def run_backtest_comparison(
         & np.isfinite(df["close_exit"])
     )
 
-    # 3. 规则版信号
+    # 3. 规则版信号（固定杠杆 0.5）
     df["is_trade_rule"] = rule_mask
 
-    # 4. ML版信号（规则 + 概率过滤）
-    df["is_trade_ml"] = rule_mask & (df["ml_prob"] >= prob_threshold)
+    # 4. ML版：计算动态杠杆（3档分级，进攻型）
+    # 注意：新模型的概率分布非常窄（都在0.22左右），需要使用百分位数作为阈值
+    # 计算实际的百分位数阈值
+    p25 = df["ml_prob"].quantile(0.25)
+    p50 = df["ml_prob"].quantile(0.50)
+    p75 = df["ml_prob"].quantile(0.75)
+
+    logger.info(f"  - 动态杠杆阈值: 25%={p25:.4f}, 50%={p50:.4f}, 75%={p75:.4f}")
+
+    conditions = [
+        df["ml_prob"] >= p75,  # 顶级+优质信号：前25%，超额押注
+        df["ml_prob"] >= p50,  # 中等信号：中位数以上，主力头寸
+        df["ml_prob"] >= p25,  # 边缘信号：25%分位以上，贡献频率
+    ]
+    choices = [1.2, 0.8, 0.4]  # 进攻型杠杆配置
+    df["dynamic_leverage"] = np.select(conditions, choices, default=0.0)
+
+    # ML版信号：规则满足 且 动态杠杆 > 0
+    df["is_trade_ml"] = rule_mask & (df["dynamic_leverage"] > 0)
 
     n_rule = df["is_trade_rule"].sum()
     n_ml = df["is_trade_ml"].sum()
+    n_top = (rule_mask & (df["ml_prob"] >= 0.50)).sum()
+    n_mid = (rule_mask & (df["ml_prob"] >= 0.46) & (df["ml_prob"] < 0.50)).sum()
+    n_low = (rule_mask & (df["ml_prob"] >= 0.3) & (df["ml_prob"] < 0.46)).sum()
+    n_skip = (rule_mask & (df["ml_prob"] < 0.3)).sum()
+
     logger.info(
         f"规则版信号: {n_rule:,} | ML版信号: {n_ml:,} | 过滤比例: {(1-n_ml/n_rule)*100:.1f}%"
     )
+    logger.info(f"  - 顶级信号(杠杆1.2): {n_top:,} ({n_top/n_rule*100:.1f}%)")
+    logger.info(f"  - 中等信号(杠杆0.8): {n_mid:,} ({n_mid/n_rule*100:.1f}%)")
+    logger.info(f"  - 边缘信号(杠杆0.4): {n_low:,} ({n_low/n_rule*100:.1f}%)")
+    logger.info(f"  - 放弃交易(杠杆0.0): {n_skip:,} ({n_skip/n_rule*100:.1f}%)")
 
     # 5. 计算收益（止盈止损逻辑）
     tp_ratio = TAKE_PROFIT_BP / 10000
@@ -190,19 +243,27 @@ def run_backtest_comparison(
     )
     df["t_net_return"] = df["t_gross_return"] - TRADE_COST
 
-    # 6. 分别计算两版的每日收益
+    # 6. 分别计算两版的每日收益（核心差异：动态杠杆 vs 固定杠杆）
     results_list = []
 
     for version, is_trade_col in [("rule", "is_trade_rule"), ("ml", "is_trade_ml")]:
         df_trades = df[df[is_trade_col]].copy()
 
+        if version == "ml":
+            # ML版：使用动态杠杆计算收益贡献
+            df_trades["t_contribution"] = (
+                df_trades["t_net_return"] * df_trades["dynamic_leverage"]
+            )
+        else:
+            # 规则版：使用固定杠杆 0.5
+            df_trades["t_contribution"] = df_trades["t_net_return"] * T_LEVERAGE
+
         daily_t_alpha = (
-            df_trades.groupby(["date", "SecuCode"])["t_net_return"]
+            df_trades.groupby(["date", "SecuCode"])["t_contribution"]
             .sum()
             .reset_index()
-            .rename(columns={"t_net_return": f"t_alpha_{version}"})
+            .rename(columns={"t_contribution": f"t_alpha_{version}"})
         )
-        daily_t_alpha[f"t_alpha_{version}"] *= T_LEVERAGE
 
         results_list.append(daily_t_alpha)
 
