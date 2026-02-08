@@ -1,7 +1,7 @@
 """
-相关性测试脚本：特征与标签的相关性分析
+IC相关性分析脚本
 
-职责：读取特征数据，按 (入场时间, 持有时间) 组合计算相关性
+职责：读取特征数据，按 (入场时间, 持有时间) 组合计算特征与标签的相关性
 输入：df_features_{year}.pkl
 
 分析维度：
@@ -25,15 +25,12 @@ warnings.filterwarnings("ignore")
 
 # ==================== 配置参数 ====================
 CACHE_DIR = Path("/nfs/ofs-prediction/peterzhenglinpeng/vwap-research/backtest_cache")
-OUTPUT_DIR = Path("/nfs/volume-1593-1/peterzhenglinpeng/vwap-research/output")
-OUTPUT_DIR.mkdir(exist_ok=True)
 
 YEAR = 2025
 
 # 入场时间列表
 # ENTRY_TIMES = ["09:45", "10:00", "10:30", "11:00", "13:05", "13:30", "14:00"]
 ENTRY_TIMES = ["10:30"]
-
 
 # 持有时间列表: (标签列名, 显示名)
 # HOLD_HORIZONS = [
@@ -57,6 +54,7 @@ FEATURES = [
 ]
 
 
+# ==================== 数据加载 ====================
 def load_features(year: int) -> pd.DataFrame:
     """加载特征数据"""
     pkl_path = CACHE_DIR / f"df_features_{year}.pkl"
@@ -85,6 +83,7 @@ def prefilter(df: pd.DataFrame) -> pd.DataFrame:
     return df_valid
 
 
+# ==================== 核心计算 ====================
 def calc_corr_for_subset(df_sub: pd.DataFrame, label_col: str) -> dict:
     """计算一个子集上各特征与指定标签的相关性"""
     # 过滤标签异常值
@@ -108,7 +107,7 @@ def analyze_correlation(df: pd.DataFrame) -> list:
 
     返回: list of dict，每行是一个组合的结果
     """
-    logger.info("开始相关性分析...")
+    logger.info("开始IC相关性分析...")
     rows = []
 
     for entry_time in ENTRY_TIMES:
@@ -158,14 +157,15 @@ def analyze_correlation(df: pd.DataFrame) -> list:
 
         logger.debug(f"  入场时间 {entry_time} 分析完成")
 
-    logger.success(f"相关性分析完成: {len(rows)} 个组合")
+    logger.success(f"IC相关性分析完成: {len(rows)} 个组合")
     return rows
 
 
+# ==================== 报告打印 ====================
 def print_report(df_result: pd.DataFrame):
     """打印报告"""
     print("\n" + "=" * 100)
-    print("特征-标签相关性分析报告")
+    print("IC相关性分析报告")
     print(f"  特征: {', '.join(fn for _, fn in FEATURES)}")
     print(f"  入场时间: {', '.join(ENTRY_TIMES)}")
     print(f"  持有时间: {', '.join(hn for _, hn in HOLD_HORIZONS)}")
@@ -225,23 +225,22 @@ def print_report(df_result: pd.DataFrame):
     print("\n" + "=" * 100)
 
 
+# ==================== 主函数 ====================
 def main():
     """主函数"""
     logger.info("=" * 60)
-    logger.info("相关性测试：特征与标签的相关性分析")
+    logger.info("IC相关性分析")
     logger.info("=" * 60)
 
     # 1. 加载并预过滤
     df = load_features(YEAR)
     df = prefilter(df)
 
-    # 3. 按入场时间分析
-    rows_by_time = analyze_correlation(df)
+    # 2. 计算相关性
+    rows = analyze_correlation(df)
+    df_result = pd.DataFrame(rows)
 
-    # 4. 合并结果
-    df_result = pd.DataFrame(rows_by_time)
-
-    # 5. 打印报告
+    # 3. 打印报告
     print_report(df_result)
 
     return df_result
