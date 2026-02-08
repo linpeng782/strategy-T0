@@ -4,8 +4,19 @@
 *.jpg
 *.jpeg
 *.gif
+*.txt
 
-# Jupyter 笔记本（除了设计方案）
+# 配置文件
+config/csi1000_components_*.json
+
+# 输出目录
+output/
+output/model/
+output/lgbm_classifier.txt
+
+# Jupyter 笔记本
+*.ipynb
+design_scheme_*.ipynb
 metting_summary_*.ipynb
 results_summary.ipynb
 sandbox.ipynb
