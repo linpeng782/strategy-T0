@@ -38,7 +38,7 @@ YEAR = 2025
 # 回测参数
 COST_RATE = 0.0015  # 双边交易成本（佣金+印花税+滑点）
 HOLD_BARS_LIST = [6, 12, 24]  # 持仓Bar数
-THRESHOLD_LIST = [-2.0, -1.5, -1.0, -0.5]  # X2_zscore 阈值
+THRESHOLD_LIST = [-2.0, -1.5, -1.0]  # X2_zscore 阈值
 SIGNAL_COL = "X2_zscore"  # 信号列
 
 # 交易时间窗口（剔除开盘和尾盘）
@@ -93,16 +93,51 @@ def run_single_backtest(
     if df_buy.empty:
         return pd.DataFrame()
 
-    # 3. 计算买卖价格
+    # 3. 去重叠：同一只股票同一天，持仓期间跳过新信号
+    # 冷却期 = hold_bars + 1（买入延迟1个Bar + 持仓hold_bars个Bar）
+    cooldown = hold_bars + 1
+    final_indices = []
+    last_end = {}  # (stock, date) -> 上一笔交易结束的行位置
+
+    for idx in df_buy.index:
+        stock = df_buy.loc[idx, "SecuCode"]
+        date = df_buy.loc[idx, "date"]
+        key = (stock, date)
+
+        # 获取当前信号在全量df中的行位置
+        pos = df.index.get_loc(idx)
+
+        if key not in last_end or pos >= last_end[key]:
+            final_indices.append(idx)
+            # 标记这笔交易的结束位置
+            last_end[key] = pos + cooldown
+
+    df_buy = df_buy.loc[final_indices]
+    logger.debug(
+        f"去重叠: 阈值={threshold}, 持仓={hold_bars}bars, "
+        f"原始信号{buy_mask.sum()}笔 -> 去重后{len(df_buy)}笔"
+    )
+
+    if df_buy.empty:
+        return pd.DataFrame()
+
+    # 4. 计算买卖价格
     grp = df.groupby(["SecuCode", "date"])
 
     # 买入价：下一个Bar的VWAP（决策后执行）
     df["buy_price"] = grp["vwap_5m"].shift(-1)
 
-    # 卖出价：买入Bar之后第hold_bars个Bar的VWAP
-    df["sell_price"] = grp["vwap_5m"].shift(-(hold_bars + 1))
+    # 卖出价：持仓期间整段VWAP（与相关性测试V_next_Xm一致）
+    # 即买入Bar之后hold_bars个Bar的加权均价
+    cum_amt_s1 = grp["cum_amount"].shift(-1)
+    cum_vol_s1 = grp["cum_volume"].shift(-1)
+    cum_amt_sN = grp["cum_amount"].shift(-(hold_bars + 1))
+    cum_vol_sN = grp["cum_volume"].shift(-(hold_bars + 1))
+    df["sell_price"] = ((cum_amt_sN - cum_amt_s1) / (cum_vol_sN - cum_vol_s1)).replace(
+        [np.inf, -np.inf], np.nan
+    )
 
-    # 卖出时间
+    # 卖出时间（持仓结束Bar的时间，仅用于展示）
     df["sell_time"] = grp["entry_time"].shift(-(hold_bars + 1))
 
     # 4. 提取买入信号行的买卖价格

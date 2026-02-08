@@ -27,34 +27,24 @@ DATA_DIR = Path(
 CACHE_DIR = Path("/nfs/ofs-prediction/peterzhenglinpeng/vwap-research/backtest_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# 股票池
-STOCK_CODES = ["002591", "002494", "002247", "000001", "300750", "601318"]
-YEAR = 2025
+YEAR = 2024
 
 
-def load_minute_data(stock_codes: list, year: int) -> pd.DataFrame:
-    """加载指定股票的1分钟数据"""
+def load_minute_data(year: int) -> pd.DataFrame:
+    """加载全量1分钟数据"""
     pkl_path = DATA_DIR / f"{year}.pkl"
     if not pkl_path.exists():
         raise FileNotFoundError(f"文件不存在: {pkl_path}")
 
-    logger.info(f"加载 {year} 年1分钟数据: {pkl_path}")
+    logger.info(f"加载 {year} 年全量1分钟数据: {pkl_path}")
     df = pd.read_pickle(pkl_path)
+    df = df.sort_values(["SecuCode", "TradingDay"]).reset_index(drop=True)
+    df["date"] = df["TradingDay"].dt.date
 
-    # 筛选目标股票
-    result = df[df["SecuCode"].isin(stock_codes)].copy()
-    if len(result) == 0:
-        raise ValueError(f"未找到 {stock_codes} 的数据")
-
-    result = result.sort_values(["SecuCode", "TradingDay"]).reset_index(drop=True)
-    result["date"] = result["TradingDay"].dt.date
-
-    n_stocks = result["SecuCode"].nunique()
-    n_days = result["date"].nunique()
-    logger.success(
-        f"加载完成: {len(result):,} 条, {n_stocks} 只股票, {n_days} 个交易日"
-    )
-    return result
+    n_stocks = df["SecuCode"].nunique()
+    n_days = df["date"].nunique()
+    logger.success(f"加载完成: {len(df):,} 条, {n_stocks} 只股票, {n_days} 个交易日")
+    return df
 
 
 def aggregate_to_5min_bars(df: pd.DataFrame) -> pd.DataFrame:
@@ -100,8 +90,8 @@ def main():
     logger.info("开始数据聚合：1分钟 → 5分钟Bar")
     logger.info("=" * 50)
 
-    # 1. 加载1分钟数据
-    df_1m = load_minute_data(STOCK_CODES, YEAR)
+    # 1. 加载全量1分钟数据
+    df_1m = load_minute_data(YEAR)
 
     # 2. 聚合为5分钟Bar
     df_5m = aggregate_to_5min_bars(df_1m)

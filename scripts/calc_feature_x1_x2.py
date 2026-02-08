@@ -23,6 +23,8 @@ bar_time 使用 ceil（Bar的结束时间），与米筐get_price()一致
 日期：2025-02
 """
 
+import json
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -35,12 +37,17 @@ warnings.filterwarnings("ignore")
 CACHE_DIR = Path("/nfs/ofs-prediction/peterzhenglinpeng/vwap-research/backtest_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-YEAR = 2025
+YEAR = 2024
+
+# 成分股配置文件（按年份区分）
+COMPONENTS_PATH = Path(
+    f"/nfs/volume-1593-1/peterzhenglinpeng/vwap-research/config/csi1000_components_{YEAR}.json"
+)
 ZSCORE_WINDOW = 20  # Z-Score 滚动窗口
 
 
 def load_5m_data(year: int) -> pd.DataFrame:
-    """加载预聚合的5分钟Bar数据"""
+    """加载预聚合的5分钟Bar数据，并筛选成分股"""
     pkl_path = CACHE_DIR / f"df_5m_{year}.pkl"
     if not pkl_path.exists():
         raise FileNotFoundError(
@@ -49,6 +56,19 @@ def load_5m_data(year: int) -> pd.DataFrame:
 
     logger.info(f"加载5分钟Bar数据: {pkl_path}")
     df = pd.read_pickle(pkl_path)
+    logger.info(f"全量数据: {len(df):,} 个Bar, {df['SecuCode'].nunique()} 只股票")
+
+    # 筛选成分股
+    if COMPONENTS_PATH.exists():
+        with open(COMPONENTS_PATH, "r") as f:
+            components = json.load(f)
+        df = df[df["SecuCode"].isin(components)].reset_index(drop=True)
+        logger.info(
+            f"筛选成分股后: {len(df):,} 个Bar, {df['SecuCode'].nunique()} 只股票"
+        )
+    else:
+        logger.warning(f"成分股文件不存在: {COMPONENTS_PATH}，使用全量数据")
+
     n_stocks = df["SecuCode"].nunique()
     n_days = df["date"].nunique()
     logger.success(f"加载完成: {len(df):,} 个Bar, {n_stocks} 只股票, {n_days} 个交易日")
@@ -99,29 +119,37 @@ def calculate_features_and_labels(df: pd.DataFrame) -> pd.DataFrame:
     total_amount = grp["amount"].transform("sum")
     total_volume = grp["volume"].transform("sum")
 
-    # Y: V_rest = 下一个Bar之后到收盘的VWAP
-    rest_amount = total_amount - cum_amt_s1
-    rest_volume = total_volume - cum_vol_s1
-    df["V_rest"] = (rest_amount / rest_volume).replace([np.inf, -np.inf], np.nan)
-    df["Y"] = df["next_vwap_5m"] / df["V_rest"]
-
-    # Y_15m ~ Y_120m: 不同时间维度的标签（通用公式）
-    for minutes, label_suffix in [
+    # 统一计算所有时间维度的标签
+    # "rest" 表示到收盘（全天剩余），其余为固定分钟数
+    horizons = [
+        ("rest", "rest"),
         (15, "15m"),
         (30, "30m"),
         (60, "60m"),
         (90, "90m"),
         (120, "120m"),
-    ]:
-        offset = minutes // 5 + 1
-        cum_amt_sN = grp["cum_amount"].shift(-offset)
-        cum_vol_sN = grp["cum_volume"].shift(-offset)
+    ]
+    for minutes, label_suffix in horizons:
+        if minutes == "rest":
+            # 到收盘：用全天总量 - 下一个Bar的累积量
+            cum_amt_sN = total_amount
+            cum_vol_sN = total_volume
+        else:
+            # 固定分钟数：shift(-offset) 取未来第offset个Bar的累积量
+            offset = minutes // 5 + 1
+            cum_amt_sN = grp["cum_amount"].shift(-offset)
+            cum_vol_sN = grp["cum_volume"].shift(-offset)
+
         next_amount = cum_amt_sN - cum_amt_s1
         next_volume = cum_vol_sN - cum_vol_s1
         df[f"V_next_{label_suffix}"] = (next_amount / next_volume).replace(
             [np.inf, -np.inf], np.nan
         )
         df[f"Y_{label_suffix}"] = df["next_vwap_5m"] / df[f"V_next_{label_suffix}"]
+
+    # 保留兼容列名: Y = Y_rest
+    df["V_rest"] = df["V_next_rest"]
+    df["Y"] = df["Y_rest"]
 
     logger.success(f"特征和标签计算完成: {len(df):,} 行")
     return df
