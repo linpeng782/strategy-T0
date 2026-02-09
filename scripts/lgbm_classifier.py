@@ -66,7 +66,7 @@ VOL_WINDOW = 10
 DELTA_BARS = 3
 
 # 概率阈值扫描
-PROB_THRESHOLDS = [0.3, 0.35, 0.40, 0.45]
+PROB_THRESHOLDS = [0.45]
 
 # LightGBM 参数（防过拟合）
 LGB_PARAMS = {
@@ -81,7 +81,7 @@ LGB_PARAMS = {
     "min_data_in_leaf": 200,  # 增大，防过拟合
     "lambda_l1": 0.1,
     "lambda_l2": 1.0,
-    "verbose": -1,
+    "verbose": 1,
     "seed": 42,
 }
 NUM_BOOST_ROUND = 100  # 减少轮数
@@ -199,6 +199,23 @@ def predict_and_backtest(model: lgb.Booster, test_df: pd.DataFrame) -> list:
         f"预测概率分布: min={y_prob.min():.4f}, "
         f"median={np.median(y_prob):.4f}, max={y_prob.max():.4f}"
     )
+
+    # 保存测试集预测结果（供信号分析脚本使用）
+    save_cols = (
+        ["SecuCode", "date", "entry_time"]
+        + FEATURES
+        + [
+            "raw_ret",
+            "market_ret",
+            "excess_ret",
+            "is_profitable",
+            "pred_prob",
+        ]
+    )
+    save_df = test_df[save_cols].copy()
+    pred_path = OUTPUT_DIR / "lgbm_test_predictions.pkl"
+    save_df.to_pickle(pred_path)
+    logger.success(f"测试集预测结果已保存: {pred_path} ({len(save_df):,} 行)")
 
     # 对每个概率阈值做回测
     all_results = []
@@ -337,18 +354,32 @@ def plot_results(all_results: list, model: lgb.Booster):
 
     fig, axes = plt.subplots(3, 1, figsize=(16, 16))
 
-    # 1. 资金曲线
+    # 1. 资金曲线（x轴显示日期标签）
     for r in valid:
         daily_ret = r["daily_ret"]
         cum_bps = daily_ret.cumsum() * 10000
         label = f"P>{r['prob_threshold']:.2f} (S={r['sharpe']:.2f}, N={r['n_trades']})"
         axes[0].plot(range(len(cum_bps)), cum_bps.values, label=label, alpha=0.8)
 
+        # 添加日期刻度（每月首个交易日标注）
+        dates = daily_ret.index
+        date_strs = [str(d) for d in dates]
+        tick_pos, tick_labels = [], []
+        seen_months = set()
+        for i, d in enumerate(date_strs):
+            month_key = d[:7]  # "YYYY-MM"
+            if month_key not in seen_months:
+                seen_months.add(month_key)
+                tick_pos.append(i)
+                tick_labels.append(d[5:10])  # "MM-DD"
+        axes[0].set_xticks(tick_pos)
+        axes[0].set_xticklabels(tick_labels, rotation=45, fontsize=8)
+
     axes[0].set_title(
         f"LGBM Equity Curve (Train={YEAR_TRAIN}, Test={YEAR_TEST}, Cost={COST_BPS}bps)",
         fontsize=12,
     )
-    axes[0].set_xlabel("Trading Day Index")
+    axes[0].set_xlabel("Date")
     axes[0].set_ylabel("Cumulative Net Return (bps)")
     axes[0].legend(fontsize=7, loc="best")
     axes[0].grid(True, alpha=0.3)
