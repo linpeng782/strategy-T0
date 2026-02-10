@@ -36,6 +36,9 @@ COST_RATE = COST_BPS / 10000
 
 # 信号概率阈值（用于筛选 trades）
 SIGNAL_THRESHOLD = 0.45
+START_TIME = "09:50"
+END_TIME = "14:50"
+COOLDOWN_BARS = 24  # 冷却期 = 持有期（24bars=120min）
 
 # 特征列表
 FEATURES = [
@@ -47,6 +50,40 @@ FEATURES = [
     "X1_delta_15m",
     "time_index",
 ]
+
+
+# ==================== 冷却期去重 ====================
+def time_to_bar_index(t: str) -> int:
+    """将 entry_time 转为 bar 序号"""
+    h, m = map(int, t.split(":"))
+    total_min = h * 60 + m
+    if total_min <= 11 * 60 + 30:
+        return (total_min - 9 * 60 - 35) // 5
+    else:
+        return 24 + (total_min - 13 * 60) // 5
+
+
+def apply_cooldown(signals: pd.DataFrame, cooldown_bars: int) -> pd.DataFrame:
+    """冷却期去重：同一股票在 cooldown_bars 个bar内不再重复发信号"""
+    signals = signals.sort_values(["SecuCode", "date", "entry_time"]).copy()
+    signals["bar_idx"] = signals["entry_time"].apply(time_to_bar_index)
+
+    def filter_group(g):
+        g = g.sort_values("bar_idx")
+        keep = [True]
+        last_bar = g.iloc[0]["bar_idx"]
+        for i in range(1, len(g)):
+            if g.iloc[i]["bar_idx"] - last_bar >= cooldown_bars:
+                keep.append(True)
+                last_bar = g.iloc[i]["bar_idx"]
+            else:
+                keep.append(False)
+        return pd.Series(keep, index=g.index)
+
+    keep_mask = signals.groupby(["SecuCode", "date"], group_keys=False).apply(
+        filter_group, include_groups=False
+    )
+    return signals[keep_mask].copy()
 
 
 # ==================== 数据加载 ====================
@@ -96,30 +133,30 @@ def analyze_entry_time_distribution(df: pd.DataFrame, trades: pd.DataFrame):
     stats["signal_rate"] = stats["n_signals"] / stats["total"]
 
     header = (
-        f"{'EntryTime':>10}  {'Total':>8}  {'Signals':>8}  {'SigRate':>8}  "
-        f"{'AvgProb':>8}  {'WinRate':>8}  {'Prec':>8}  "
-        f"{'NetBps':>10}  {'ExcessBps':>10}"
+        f"{'EntryTime':>10s}  {'Total':>10s}  {'Signals':>8s}  {'SigRate':>8s}  "
+        f"{'AvgProb':>8s}  {'WinRate':>8s}  {'Prec':>8s}  "
+        f"{'NetBps':>10s}  {'ExcessBps':>10s}"
     )
     print(f"\n{header}")
-    print("-" * 100)
+    print("-" * 96)
 
     for t, row in stats.iterrows():
         print(
-            f"{t:>10}  {row['total']:>8.0f}  {row['n_signals']:>8.0f}  "
-            f"{row['signal_rate']:>7.2%}  {row['avg_prob']:>7.4f}  "
+            f"{t:>10s}  {row['total']:>10.0f}  {row['n_signals']:>8.0f}  "
+            f"{row['signal_rate']:>7.2%}  {row['avg_prob']:>8.4f}  "
             f"{row['win_rate']:>7.1%}  {row['precision']:>7.1%}  "
             f"{row['avg_net_bps']:>10.2f}  {row['avg_excess_bps']:>10.2f}"
         )
 
-    print("-" * 100)
+    print("-" * 96)
 
-    # 汇总
+    # 汇总行
     total_signals = len(trades_net)
     total_wr = (trades_net["net_ret"] > 0).mean()
     total_net = trades_net["net_ret"].mean() * 10000
     print(
-        f"{'TOTAL':>10}  {len(df):>8}  {total_signals:>8}  "
-        f"{total_signals/len(df):>7.2%}  {trades_net['pred_prob'].mean():>7.4f}  "
+        f"{'TOTAL':>10s}  {len(df):>10}  {total_signals:>8}  "
+        f"{total_signals/len(df):>7.2%}  {trades_net['pred_prob'].mean():>8.4f}  "
         f"{total_wr:>7.1%}  {trades_net['is_profitable'].mean():>7.1%}  "
         f"{total_net:>10.2f}  {trades_net['excess_ret'].mean()*10000:>10.2f}"
     )
@@ -393,9 +430,21 @@ def main():
         f"median={df['pred_prob'].median():.4f}, max={df['pred_prob'].max():.4f}"
     )
 
-    # 2. 筛选信号
-    trades = df[df["pred_prob"] > SIGNAL_THRESHOLD].copy()
-    logger.info(f"信号阈值={SIGNAL_THRESHOLD}, 筛选出 {len(trades):,} 笔信号")
+    # 2. 筛选信号（时间+概率+冷却期去重）
+    mask = (
+        (df["entry_time"] >= START_TIME)
+        & (df["entry_time"] <= END_TIME)
+        & (df["pred_prob"] > SIGNAL_THRESHOLD)
+    )
+    trades = df[mask].copy()
+    logger.info(
+        f"初筛信号: {len(trades):,} 笔 (prob>{SIGNAL_THRESHOLD}, {START_TIME}~{END_TIME})"
+    )
+
+    trades = apply_cooldown(trades, COOLDOWN_BARS)
+    logger.info(
+        f"去重后信号: {len(trades):,} 笔 (冷却期={COOLDOWN_BARS}bars={COOLDOWN_BARS*5}min)"
+    )
 
     # 3. 分析
     time_stats = analyze_entry_time_distribution(df, trades)

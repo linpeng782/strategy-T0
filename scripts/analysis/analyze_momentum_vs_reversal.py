@@ -39,6 +39,42 @@ PRED_PATH = OUTPUT_DIR / "lgbm_test_predictions.pkl"
 COST_BPS = 15
 COST_RATE = COST_BPS / 10000
 PROB_THRESHOLD = 0.45  # 做多模型信号门槛
+START_TIME = "09:50"
+END_TIME = "14:50"
+COOLDOWN_BARS = 24  # 冷却期 = 持有期（24bars=120min）
+
+
+def time_to_bar_index(t: str) -> int:
+    """将 entry_time 转为 bar 序号"""
+    h, m = map(int, t.split(":"))
+    total_min = h * 60 + m
+    if total_min <= 11 * 60 + 30:
+        return (total_min - 9 * 60 - 35) // 5
+    else:
+        return 24 + (total_min - 13 * 60) // 5
+
+
+def apply_cooldown(signals: pd.DataFrame, cooldown_bars: int) -> pd.DataFrame:
+    """冷却期去重：同一股票在 cooldown_bars 个bar内不再重复发信号"""
+    signals = signals.sort_values(["SecuCode", "date", "entry_time"]).copy()
+    signals["bar_idx"] = signals["entry_time"].apply(time_to_bar_index)
+
+    def filter_group(g):
+        g = g.sort_values("bar_idx")
+        keep = [True]
+        last_bar = g.iloc[0]["bar_idx"]
+        for i in range(1, len(g)):
+            if g.iloc[i]["bar_idx"] - last_bar >= cooldown_bars:
+                keep.append(True)
+                last_bar = g.iloc[i]["bar_idx"]
+            else:
+                keep.append(False)
+        return pd.Series(keep, index=g.index)
+
+    keep_mask = signals.groupby(["SecuCode", "date"], group_keys=False).apply(
+        filter_group, include_groups=False
+    )
+    return signals[keep_mask].copy()
 
 
 def load_signals() -> pd.DataFrame:
@@ -162,24 +198,28 @@ def analyze_x2_split(signals: pd.DataFrame):
 def analyze_combined_logic(signals: pd.DataFrame):
     """按 notebook 提出的两套逻辑拆分"""
     # 逻辑A：强势动量 — X1_zscore_rank 高 + rel_vol 高
-    logic_a = signals[(signals["X1_zscore_rank"] > 0.7) & (signals["rel_vol"] > 1.2)]
+    mask_a = (signals["X1_zscore_rank"] > 0.7) & (signals["rel_vol"] > 1.2)
 
     # 逻辑B：超跌反转 — X1_zscore 极低 + X2_zscore 极低 + rel_vol 高
-    logic_b = signals[
+    mask_b = (
         (signals["X1_zscore"] < -1)
         & (signals["X2_zscore"] < -1)
         & (signals["rel_vol"] > 1.2)
-    ]
+    )
 
-    # 其余信号
-    logic_a_idx = set(logic_a.index)
-    logic_b_idx = set(logic_b.index)
-    other_idx = set(signals.index) - logic_a_idx - logic_b_idx
-    logic_other = signals.loc[list(other_idx)]
+    # 重叠信号优先归逻辑B（超跌反转更符合其特征本质），从A中剔除
+    overlap_count = (mask_a & mask_b).sum()
+    logger.info(f"逻辑A与逻辑B重叠: {overlap_count} 笔（优先归逻辑B）")
+    mask_a_exclusive = mask_a & ~mask_b  # A中剔除与B重叠的部分
 
-    # 交集
-    overlap_idx = logic_a_idx & logic_b_idx
-    logger.info(f"逻辑A与逻辑B重叠: {len(overlap_idx)} 笔")
+    logic_a = signals[mask_a_exclusive]
+    logic_b = signals[mask_b]
+    logic_other = signals[~mask_a_exclusive & ~mask_b]
+
+    # 校验三组互斥且总和=ALL
+    assert len(logic_a) + len(logic_b) + len(logic_other) == len(
+        signals
+    ), f"分组不互斥: {len(logic_a)}+{len(logic_b)}+{len(logic_other)} != {len(signals)}"
 
     results = [
         calc_group_stats(signals, "ALL signals"),
@@ -313,9 +353,22 @@ def main():
     # 加载数据
     df = load_signals()
 
-    # 筛选信号（与做多模型回测一致）
-    signals = df[df["pred_prob"] > PROB_THRESHOLD].copy()
-    logger.info(f"信号数: {len(signals):,} 笔 (pred_prob > {PROB_THRESHOLD})")
+    # 筛选信号（与做多模型回测一致：时间+概率+冷却期去重）
+    mask = (
+        (df["entry_time"] >= START_TIME)
+        & (df["entry_time"] <= END_TIME)
+        & (df["pred_prob"] > PROB_THRESHOLD)
+    )
+    signals = df[mask].copy()
+    logger.info(
+        f"初筛信号: {len(signals):,} 笔 (prob>{PROB_THRESHOLD}, {START_TIME}~{END_TIME})"
+    )
+
+    # 冷却期去重
+    signals = apply_cooldown(signals, COOLDOWN_BARS)
+    logger.info(
+        f"去重后信号: {len(signals):,} 笔 (冷却期={COOLDOWN_BARS}bars={COOLDOWN_BARS*5}min)"
+    )
     logger.info(
         f"信号特征均值: X1={signals['X1_zscore'].mean():.4f}, "
         f"X2={signals['X2_zscore'].mean():.4f}, "
