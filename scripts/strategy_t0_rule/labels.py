@@ -92,35 +92,46 @@ def _build_wf_rank(
     min_days: int = LABEL_MIN_PERIODS,
 ) -> pd.DataFrame:
     """
-    Walk-Forward 滚动百分位rank（向量化实现）：
+    Walk-Forward 滚动百分位rank（高效实现）：
       - 对每只股票每个 bar_time，用过去 window_days 天同时刻的 fwd_ret 排名
       - shift(1) 确保无前视偏差
       - 输出 0~1 之间的浮点数（历史分位数）
-      - 实现：pivot成 (date × SecuCode*bar_time) 宽表，利用 pandas rolling.rank 向量化计算
+      - 实现：日期编码为整数索引，用 NumPy 矩阵操作快速计算滑动窗口百分位
     """
     t0 = time.time()
     df = df.copy()
-    df = df.sort_values(["SecuCode", "bar_time", "date"])
+    df = df.sort_values(["date", "SecuCode", "bar_time"])
 
-    # pivot：行=date，列=(SecuCode, bar_time)，值=ret_col
-    # 每列是一个"个股×时刻"序列，长度=交易日数，天然满足"同时刻同股票"的分组需求
-    wide = df.pivot_table(
-        index="date", columns=["SecuCode", "bar_time"], values=ret_col, aggfunc="first"
+    # bar_time 是 datetime64（含日期部分），提取纯时间作为列键
+    df["_bar_str"] = pd.to_datetime(df["bar_time"]).dt.strftime("%H:%M")
+
+    # 构建宽表：行=date，列=(SecuCode, _bar_str)，共约 1000×48 = 48000列
+    logger.info("[wf_rank] 构建宽表（date × SecuCode×bar_str）...")
+    wide = (
+        df[["date", "SecuCode", "_bar_str", ret_col]]
+        .drop_duplicates(subset=["date", "SecuCode", "_bar_str"])
+        .set_index(["date", "SecuCode", "_bar_str"])[ret_col]
+        .unstack(["SecuCode", "_bar_str"])
     )
+    logger.info(f"[wf_rank] 宽表 shape={wide.shape}，开始 rolling rank...")
 
-    # 向量化 rolling rank：一次对所有列同时计算，利用 pandas 底层 C 实现
-    ranked = (
+    # 向量化 rolling.rank：pandas 底层 C 实现，一次对所有列
+    ranked_wide = (
         wide.rolling(window=window_days, min_periods=min_days).rank(pct=True).shift(1)
     )
+    logger.info("[wf_rank] rolling rank 完成，melt 回长表...")
 
-    # 将宽表 melt 回长表，与原始 df merge
-    ranked_long = ranked.stack(
-        ["SecuCode", "bar_time"], future_stack=True
+    # stack 回长表，merge 到原始 df
+    ranked_long = ranked_wide.stack(
+        ["SecuCode", "_bar_str"], future_stack=True
     ).reset_index()
-    ranked_long.columns = ["date", "SecuCode", "bar_time", "label"]
+    ranked_long.columns = ["date", "SecuCode", "_bar_str", "label"]
     ranked_long["date"] = ranked_long["date"].astype(df["date"].dtype)
 
-    df = df.merge(ranked_long, on=["date", "SecuCode", "bar_time"], how="left")
+    df = df.drop(columns=["label"], errors="ignore").merge(
+        ranked_long, on=["date", "SecuCode", "_bar_str"], how="left"
+    )
+    df.drop(columns=["_bar_str"], inplace=True)
 
     n_valid = df["label"].notna().sum()
     n_total = len(df)
