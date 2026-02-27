@@ -28,8 +28,7 @@ RESULT_CSV = Path(
 OUTPUT_DIR = Path("/nfs/volume-1593-1/peterzhenglinpeng/vwap-research/output")
 RET_COL = "fwd_ret_30min"
 
-# Walk-Forward 信号参数
-# 用过去LOOKBACK_DAYS天的pred日均值分布，估计第(100-SIGNAL_PCT*100)和SIGNAL_PCT*100分位数
+
 SIGNAL_PCT = 0.001  # 历史分布的极端分位，触发做多/做空（狙击手策略：Bot 0.1%）
 LOOKBACK_DAYS = 10  # 滚动历史窗口（交易日），相当于约一个月
 
